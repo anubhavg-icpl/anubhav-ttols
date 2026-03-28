@@ -1,4 +1,3 @@
-using System.Management;
 using anubhav_ttols;
 
 namespace anubhav_ttols.Tests;
@@ -21,7 +20,7 @@ public class MockWmiProvider : IWmiProvider
     {
         DeployCalls.Add(policyGuid);
         if (ThrowOnDeploy)
-            throw new ManagementException("Access denied");
+            throw new InvalidOperationException("Access denied");
 
         DeployedPolicies[policyGuid] = policyBase64;
     }
@@ -30,12 +29,12 @@ public class MockWmiProvider : IWmiProvider
     {
         DeleteCalls.Add(policyGuid);
         if (ThrowNotFoundOnDelete)
-            throw new ManagementException("Not found");
+            throw new InvalidOperationException("Not found");
         if (ThrowOnDelete)
-            throw new ManagementException("Generic WMI error");
+            throw new InvalidOperationException("Generic WMI error");
 
         if (!DeployedPolicies.Remove(policyGuid))
-            throw new ManagementException("Not found");
+            throw new InvalidOperationException("Not found");
     }
 
     public List<PolicyInstance> GetAllPolicies()

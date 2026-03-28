@@ -1,4 +1,3 @@
-using System.Management;
 using anubhav_ttols;
 
 if (args.Length == 0)
@@ -68,11 +67,6 @@ static int RunApply(string[] args, PolicyManager manager)
             WriteSuccess($"Policy {policyGuid} deployed successfully.");
         return result;
     }
-    catch (ManagementException ex)
-    {
-        WriteError($"WMI error deploying policy: {ex.Message} (0x{ex.ErrorCode:X})");
-        return 1;
-    }
     catch (Exception ex)
     {
         WriteError($"Error deploying policy: {ex.Message}");
@@ -102,14 +96,9 @@ static int RunRemove(string[] args, PolicyManager manager)
         }
         return result;
     }
-    catch (ManagementException ex) when (ex.ErrorCode == ManagementStatus.NotFound)
+    catch (InvalidOperationException)
     {
         WriteError($"Policy {policyGuid} not found.");
-        return 1;
-    }
-    catch (ManagementException ex)
-    {
-        WriteError($"WMI error removing policy: {ex.Message} (0x{ex.ErrorCode:X})");
         return 1;
     }
     catch (Exception ex)
@@ -138,11 +127,6 @@ static int RunList(PolicyManager manager)
             Console.WriteLine($"{policy.InstanceId,-40} {info.IsAuthorized,-12} {info.IsDeployed,-10} {info.IsEffective,-10} {info.Status,-8} {info.Version}");
         }
         return exitCode;
-    }
-    catch (ManagementException ex)
-    {
-        WriteError($"WMI error listing policies: {ex.Message}");
-        return 1;
     }
     catch (Exception ex)
     {

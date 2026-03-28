@@ -1,4 +1,4 @@
-using System.Management;
+using Microsoft.Management.Infrastructure;
 using System.Security.Principal;
 
 namespace anubhav_ttols;
@@ -34,63 +34,99 @@ public sealed class WmiProvider : IWmiProvider
 
     public void DeployPolicy(string policyGuid, string policyBase64)
     {
-        using var mgmtClass = new ManagementClass(Namespace, ClassName, null);
-        using var instance = mgmtClass.CreateInstance();
-        instance["ParentID"] = ParentId;
-        instance["InstanceID"] = policyGuid;
-        instance["Policy"] = policyBase64;
-        instance.Put();
+        using var session = CimSession.Create(null);
+
+        // Try to get existing instance first (for Replace)
+        CimInstance? existing = null;
+        try
+        {
+            existing = GetCimInstance(session, ClassName, policyGuid);
+        }
+        catch
+        {
+            // Not found — will create new
+        }
+
+        if (existing is not null)
+        {
+            existing.CimInstanceProperties["Policy"].Value = policyBase64;
+            session.ModifyInstance(Namespace, existing);
+            existing.Dispose();
+        }
+        else
+        {
+            using var newInstance = new CimInstance(ClassName, Namespace);
+            newInstance.CimInstanceProperties.Add(CimProperty.Create("ParentID", ParentId, CimFlags.Key));
+            newInstance.CimInstanceProperties.Add(CimProperty.Create("InstanceID", policyGuid, CimFlags.Key));
+            newInstance.CimInstanceProperties.Add(CimProperty.Create("Policy", policyBase64, CimFlags.Property));
+            session.CreateInstance(Namespace, newInstance);
+        }
     }
 
     public void DeletePolicy(string policyGuid)
     {
-        string instancePath = $"{ClassName}.ParentID=\"{ParentId}\",InstanceID=\"{policyGuid}\"";
-        using var instance = new ManagementObject(Namespace, instancePath, null);
-        instance.Get();
-        instance.Delete();
+        using var session = CimSession.Create(null);
+        var instance = GetCimInstance(session, ClassName, policyGuid);
+        session.DeleteInstance(Namespace, instance);
+        instance.Dispose();
     }
 
     public List<PolicyInstance> GetAllPolicies()
     {
         var policies = new List<PolicyInstance>();
-        using var searcher = new ManagementObjectSearcher(Namespace, $"SELECT * FROM {ClassName}");
-        foreach (ManagementObject obj in searcher.Get())
+        using var session = CimSession.Create(null);
+
+        foreach (var obj in session.EnumerateInstances(Namespace, ClassName))
         {
-            string id = obj["InstanceID"]?.ToString() ?? "?";
-            string policy = obj["Policy"]?.ToString() ?? "";
+            string id = obj.CimInstanceProperties["InstanceID"]?.Value?.ToString() ?? "?";
+            string policy = obj.CimInstanceProperties["Policy"]?.Value?.ToString() ?? "";
             policies.Add(new PolicyInstance(id, policy));
+            obj.Dispose();
         }
+
         return policies;
     }
 
     public PolicyInfoResult GetPolicyInfo(string policyGuid)
     {
-        return new PolicyInfoResult(
-            IsAuthorized: QueryInfoProperty(policyGuid, "IsAuthorized"),
-            IsDeployed: QueryInfoProperty(policyGuid, "IsDeployed"),
-            IsEffective: QueryInfoProperty(policyGuid, "IsEffective"),
-            IsBasePolicy: QueryInfoProperty(policyGuid, "IsBasePolicy"),
-            IsSystemPolicy: QueryInfoProperty(policyGuid, "IsSystemPolicy"),
-            Status: QueryInfoProperty(policyGuid, "Status"),
-            Version: QueryInfoProperty(policyGuid, "Version"),
-            FriendlyName: QueryInfoProperty(policyGuid, "FriendlyName"),
-            BasePolicyId: QueryInfoProperty(policyGuid, "BasePolicyId"),
-            PolicyOptions: QueryInfoProperty(policyGuid, "PolicyOptions"));
-    }
-
-    private static string QueryInfoProperty(string policyGuid, string property)
-    {
+        using var session = CimSession.Create(null);
         try
         {
-            string instancePath = $"{InfoClassName}.ParentID=\"{ParentId}/{policyGuid}/PolicyInfo\",InstanceID=\"{property}\"";
-            using var obj = new ManagementObject(Namespace, instancePath, null);
-            obj.Get();
-            return obj[property]?.ToString() ?? "-";
+            var instance = GetCimInstance(session, ClassName, policyGuid);
+            var result = new PolicyInfoResult(
+                IsAuthorized: GetProp(instance, "IsAuthorized"),
+                IsDeployed: GetProp(instance, "IsDeployed"),
+                IsEffective: GetProp(instance, "IsEffective"),
+                IsBasePolicy: GetProp(instance, "IsBasePolicy"),
+                IsSystemPolicy: GetProp(instance, "IsSystemPolicy"),
+                Status: GetProp(instance, "Status"),
+                Version: GetProp(instance, "Version"),
+                FriendlyName: GetProp(instance, "FriendlyName"),
+                BasePolicyId: GetProp(instance, "BasePolicyId"),
+                PolicyOptions: GetProp(instance, "PolicyOptions"));
+            instance.Dispose();
+            return result;
         }
         catch
         {
-            return "-";
+            return new PolicyInfoResult();
         }
+    }
+
+    private static CimInstance GetCimInstance(CimSession session, string className, string policyGuid)
+    {
+        string query = $"SELECT * FROM {className} WHERE InstanceID='{policyGuid}'";
+        var result = session.QueryInstances(Namespace, "WQL", query);
+        foreach (var instance in result)
+        {
+            return instance;
+        }
+        throw new InvalidOperationException($"Policy {policyGuid} not found");
+    }
+
+    private static string GetProp(CimInstance instance, string name)
+    {
+        return instance.CimInstanceProperties[name]?.Value?.ToString() ?? "-";
     }
 }
 
