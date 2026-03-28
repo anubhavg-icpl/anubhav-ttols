@@ -34,7 +34,7 @@ public sealed class WmiProvider : IWmiProvider
 
     public void DeployPolicy(string policyGuid, string policyBase64)
     {
-        using var session = CimSession.Create(null);
+        using var session = CimSession.Create("localhost");
 
         // Try to get existing instance first (for Replace)
         CimInstance? existing = null;
@@ -56,16 +56,16 @@ public sealed class WmiProvider : IWmiProvider
         else
         {
             using var newInstance = new CimInstance(ClassName, Namespace);
-            newInstance.CimInstanceProperties.Add(CimProperty.Create("ParentID", ParentId, CimFlags.Key));
-            newInstance.CimInstanceProperties.Add(CimProperty.Create("InstanceID", policyGuid, CimFlags.Key));
-            newInstance.CimInstanceProperties.Add(CimProperty.Create("Policy", policyBase64, CimFlags.Property));
+            newInstance.CimInstanceProperties.Add(CimProperty.Create("ParentID", ParentId, CimType.String, CimFlags.Key));
+            newInstance.CimInstanceProperties.Add(CimProperty.Create("InstanceID", policyGuid, CimType.String, CimFlags.Key));
+            newInstance.CimInstanceProperties.Add(CimProperty.Create("Policy", policyBase64, CimType.String, CimFlags.Property));
             session.CreateInstance(Namespace, newInstance);
         }
     }
 
     public void DeletePolicy(string policyGuid)
     {
-        using var session = CimSession.Create(null);
+        using var session = CimSession.Create("localhost");
         var instance = GetCimInstance(session, ClassName, policyGuid);
         session.DeleteInstance(Namespace, instance);
         instance.Dispose();
@@ -74,7 +74,7 @@ public sealed class WmiProvider : IWmiProvider
     public List<PolicyInstance> GetAllPolicies()
     {
         var policies = new List<PolicyInstance>();
-        using var session = CimSession.Create(null);
+        using var session = CimSession.Create("localhost");
 
         foreach (var obj in session.EnumerateInstances(Namespace, ClassName))
         {
@@ -89,7 +89,7 @@ public sealed class WmiProvider : IWmiProvider
 
     public PolicyInfoResult GetPolicyInfo(string policyGuid)
     {
-        using var session = CimSession.Create(null);
+        using var session = CimSession.Create("localhost");
         try
         {
             var instance = GetCimInstance(session, ClassName, policyGuid);
