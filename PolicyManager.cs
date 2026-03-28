@@ -44,6 +44,8 @@ public sealed class WmiProvider : IWmiProvider
 
     public void DeployPolicy(string policyGuid, string policyBase64)
     {
+        // MDM WMI Bridge write operations require SYSTEM context
+        using var impersonation = NativeSystem.IsSystem() ? null : NativeSystem.ImpersonateSystem();
         using var session = CreateSession();
 
         // Check if policy already exists (for Replace/Update)
@@ -70,7 +72,10 @@ public sealed class WmiProvider : IWmiProvider
 
     public void DeletePolicy(string policyGuid)
     {
+        // MDM WMI Bridge write operations require SYSTEM context
+        using var impersonation = NativeSystem.IsSystem() ? null : NativeSystem.ImpersonateSystem();
         using var session = CreateSession();
+
         var instance = FindInstance(session, ClassName, policyGuid)
             ?? throw new InvalidOperationException($"Policy {policyGuid} not found");
         session.DeleteInstance(Namespace, instance);
