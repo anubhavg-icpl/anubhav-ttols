@@ -144,9 +144,7 @@ static int PrintUsage()
     Console.WriteLine("  anubhav-ttols remove <policy-GUID>");
     Console.WriteLine("  anubhav-ttols list");
     Console.WriteLine();
-    Console.WriteLine("Requires SYSTEM context. Run via:");
-    Console.WriteLine("  psexec -s -i anubhav-ttols.exe <command>");
-    Console.WriteLine("  or use Task Scheduler as SYSTEM");
+    Console.WriteLine("Requires elevation (run as Administrator).");
     return 0;
 }
 
