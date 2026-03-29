@@ -1,5 +1,6 @@
 using Microsoft.Management.Infrastructure;
 using Microsoft.Management.Infrastructure.Options;
+using System.Security.Cryptography.Pkcs;
 using System.Security.Principal;
 
 namespace anubhav_ttols;
@@ -24,7 +25,8 @@ public record PolicyInfoResult(
     string Version = "-",
     string FriendlyName = "-",
     string BasePolicyId = "-",
-    string PolicyOptions = "-");
+    string PolicyOptions = "-",
+    string IsSignedPolicy = "-");
 
 public sealed class WmiProvider : IWmiProvider
 {
@@ -33,6 +35,15 @@ public sealed class WmiProvider : IWmiProvider
     public const string InfoClassName = "MDM_ApplicationControl_Policies01_01_PolicyInfo01";
     public const string ParentId = "./Vendor/MSFT/ApplicationControl/Policies";
 
+    // Ordered by likelihood. Probed once via GetClass() and cached.
+    private static readonly string[] InfoClassCandidates =
+    [
+        "MDM_ApplicationControl_Policies01_PolicyInfo01",      // most common
+        "MDM_ApplicationControl_Policies01_01_PolicyInfo01",   // older naming
+        "MDM_ApplicationControl_PolicyInfo01",                 // flat naming
+    ];
+    private static string? _resolvedInfoClass;
+
     private static CimSession CreateSession()
     {
         var options = new DComSessionOptions
@@ -40,6 +51,36 @@ public sealed class WmiProvider : IWmiProvider
             Impersonation = ImpersonationType.Impersonate
         };
         return CimSession.Create("localhost", options);
+    }
+
+    /// <summary>
+    /// Returns the first PolicyInfo WMI class that actually exists on this OS build,
+    /// probing via GetClass (schema-only, no instance enumeration). Result is cached.
+    /// </summary>
+    private static string? ResolveInfoClass(CimSession session)
+    {
+        if (_resolvedInfoClass is not null)
+            return _resolvedInfoClass;
+
+        foreach (var candidate in InfoClassCandidates)
+        {
+            try
+            {
+                using var cls = session.GetClass(Namespace, candidate);
+                // Verify the class actually carries the info properties we need
+                if (cls.CimClassProperties["IsAuthorized"] is not null)
+                {
+                    _resolvedInfoClass = candidate;
+                    return _resolvedInfoClass;
+                }
+            }
+            catch
+            {
+                // Class doesn't exist or has no IsAuthorized — try next
+            }
+        }
+
+        return null; // no suitable class found on this Windows build
     }
 
     public void DeployPolicy(string policyGuid, string policyBase64)
@@ -84,15 +125,33 @@ public sealed class WmiProvider : IWmiProvider
 
     public List<PolicyInstance> GetAllPolicies()
     {
+        // %SystemRoot%\System32\CodeIntegrity\CiPolicies\Active\ is the OS-maintained
+        // canonical store of every active policy. No WMI required.
         var policies = new List<PolicyInstance>();
-        using var session = CreateSession();
+        string dir = Path.Combine(Environment.SystemDirectory, "CodeIntegrity", "CiPolicies", "Active");
 
-        foreach (var obj in session.EnumerateInstances(Namespace, ClassName))
+        IEnumerable<string> files;
+        try
         {
-            string id = obj.CimInstanceProperties["InstanceID"]?.Value?.ToString() ?? "?";
-            string policy = obj.CimInstanceProperties["Policy"]?.Value?.ToString() ?? "";
-            policies.Add(new PolicyInstance(id, policy));
-            obj.Dispose();
+            if (!Directory.Exists(dir)) return policies;
+            files = Directory.GetFiles(dir); // GetFiles buffers upfront; safer than lazy Enumerate
+        }
+        catch
+        {
+            return policies;
+        }
+
+        foreach (var file in files)
+        {
+            try
+            {
+                byte[] bytes = File.ReadAllBytes(file);
+                string? id = PolicyGuidResolver.TryExtractGuidFromFilename(file)
+                             ?? PolicyGuidResolver.TryExtractGuidFromBinary(bytes);
+                if (id is not null)
+                    policies.Add(new PolicyInstance(id, Convert.ToBase64String(bytes)));
+            }
+            catch { /* skip unreadable files */ }
         }
 
         return policies;
@@ -100,31 +159,195 @@ public sealed class WmiProvider : IWmiProvider
 
     public PolicyInfoResult GetPolicyInfo(string policyGuid)
     {
-        using var session = CreateSession();
+        // Primary: WMI PolicyInfo class with SYSTEM impersonation.
+        // Works on MDM-enrolled devices where the MDM WMI bridge classes exist.
         try
         {
-            var instance = FindInstance(session, ClassName, policyGuid);
-            if (instance is null)
-                return new PolicyInfoResult();
+            using var impersonation = NativeSystem.IsSystem() ? null : NativeSystem.ImpersonateSystem();
+            using var session = CreateSession();
+            string? infoClass = ResolveInfoClass(session);
+            if (infoClass is not null)
+            {
+                var instance = FindInstance(session, infoClass, policyGuid);
+                if (instance is not null)
+                {
+                    var result = new PolicyInfoResult(
+                        IsAuthorized: Prop(instance, "IsAuthorized"),
+                        IsDeployed: Prop(instance, "IsDeployed"),
+                        IsEffective: Prop(instance, "IsEffective"),
+                        IsBasePolicy: Prop(instance, "IsBasePolicy"),
+                        IsSystemPolicy: Prop(instance, "IsSystemPolicy"),
+                        Status: Prop(instance, "Status"),
+                        Version: Prop(instance, "Version"),
+                        FriendlyName: Prop(instance, "FriendlyName"),
+                        BasePolicyId: Prop(instance, "BasePolicyId"),
+                        PolicyOptions: Prop(instance, "PolicyOptions"),
+                        IsSignedPolicy: Prop(instance, "IsSignedPolicy"));
+                    instance.Dispose();
+                    return result;
+                }
+            }
+        }
+        catch { }
 
-            var result = new PolicyInfoResult(
-                IsAuthorized: Prop(instance, "IsAuthorized"),
-                IsDeployed: Prop(instance, "IsDeployed"),
-                IsEffective: Prop(instance, "IsEffective"),
-                IsBasePolicy: Prop(instance, "IsBasePolicy"),
-                IsSystemPolicy: Prop(instance, "IsSystemPolicy"),
-                Status: Prop(instance, "Status"),
-                Version: Prop(instance, "Version"),
-                FriendlyName: Prop(instance, "FriendlyName"),
-                BasePolicyId: Prop(instance, "BasePolicyId"),
-                PolicyOptions: Prop(instance, "PolicyOptions"));
-            instance.Dispose();
-            return result;
-        }
-        catch
+        // Fallback: parse what we can directly from the policy binary.
+        // Works on any device regardless of MDM enrolment.
+        return ParseBinaryInfo(policyGuid);
+    }
+
+    /// <summary>
+    /// Locates the .cip file for <paramref name="policyGuid"/> in the Active store
+    /// and extracts every field encoded in the compiled binary.
+    ///
+    /// Signed policies are PKCS#7/CMS wrapped (first byte == 0x30).
+    /// We unwrap them with <see cref="SignedCms"/> to reach the inner binary and
+    /// then parse the same header layout as unsigned policies.
+    ///
+    /// Unsigned .cip header layout (all little-endian):
+    ///   [0x00] uint32  version identifier (currently 8)
+    ///   [0x04] GUID    PolicyTypeId  (= BasePolicyId at compile time)
+    ///   [0x14] GUID    PlatformId    (zero for most policies)
+    ///   [0x24] uint32  option flags  (bit 30 = supplemental; bits 0-20 = rule options)
+    ///   [0x38] uint32  version low   (Build &lt;&lt; 16 | Revision)
+    ///   [0x3C] uint32  version high  (Major &lt;&lt; 16 | Minor)
+    ///
+    /// Note: FriendlyName is XML-only and is NOT stored in the compiled binary.
+    /// </summary>
+    private static PolicyInfoResult ParseBinaryInfo(string policyGuid)
+    {
+        string dir = Path.Combine(Environment.SystemDirectory, "CodeIntegrity", "CiPolicies", "Active");
+        if (!Directory.Exists(dir))
+            return new PolicyInfoResult(IsDeployed: "True");
+
+        try
         {
-            return new PolicyInfoResult();
+            foreach (var file in Directory.GetFiles(dir))
+            {
+                try
+                {
+                    byte[] bytes = File.ReadAllBytes(file);
+                    string? id = PolicyGuidResolver.TryExtractGuidFromFilename(file)
+                                 ?? PolicyGuidResolver.TryExtractGuidFromBinary(bytes);
+                    if (id != policyGuid) continue;
+
+                    // Signed: PKCS#7 envelope — first byte is ASN.1 SEQUENCE tag 0x30.
+                    // Unwrap to reach the inner unsigned binary, then parse normally.
+                    bool isSigned = bytes.Length > 0 && bytes[0] == 0x30;
+                    if (isSigned)
+                    {
+                        try
+                        {
+                            var cms = new SignedCms();
+                            cms.Decode(bytes);
+                            bytes = cms.ContentInfo.Content;
+                        }
+                        catch
+                        {
+                            // Can't unwrap — return what little we know
+                            return new PolicyInfoResult(IsDeployed: "True", IsSignedPolicy: "True");
+                        }
+                    }
+
+                    return ParseUnsignedHeader(bytes, isSigned ? "True" : "False");
+                }
+                catch { /* skip unreadable file */ }
+            }
         }
+        catch { }
+
+        return new PolicyInfoResult(IsDeployed: "True");
+    }
+
+    /// <summary>Parses the fixed-size header of an unsigned .cip binary.</summary>
+    private static PolicyInfoResult ParseUnsignedHeader(byte[] bytes, string isSignedPolicy)
+    {
+        // BasePolicyId = PolicyTypeId at offset 0x04 (16 bytes)
+        string basePolicyId = "-";
+        if (bytes.Length >= 0x14)
+        {
+            try
+            {
+                var policyTypeId = new Guid(bytes.AsSpan(0x04, 16));
+                if (policyTypeId != Guid.Empty)
+                    basePolicyId = $"{{{policyTypeId:D}}}";
+            }
+            catch { }
+        }
+
+        // Option flags at 0x24:  bit 30 = supplemental, bits 0-20 = rule options
+        string isBasePolicy  = "-";
+        string policyOptions = "-";
+        if (bytes.Length >= 0x28)
+        {
+            uint flags  = BitConverter.ToUInt32(bytes, 0x24);
+            isBasePolicy  = (flags & 0x40000000u) != 0 ? "False" : "True";
+            policyOptions = DecodeOptionFlags(flags);
+        }
+
+        // Version: two uint32 words at 0x38 (low) and 0x3C (high)
+        //   vLow  = (Build << 16) | Revision
+        //   vHigh = (Major << 16) | Minor
+        string version = "-";
+        if (bytes.Length >= 0x40)
+        {
+            try
+            {
+                uint vLow  = BitConverter.ToUInt32(bytes, 0x38);
+                uint vHigh = BitConverter.ToUInt32(bytes, 0x3C);
+                ushort revision = (ushort)(vLow  & 0xFFFF);
+                ushort build    = (ushort)(vLow  >> 16);
+                ushort minor    = (ushort)(vHigh & 0xFFFF);
+                ushort major    = (ushort)(vHigh >> 16);
+                version = $"{major}.{minor}.{build}.{revision}";
+            }
+            catch { }
+        }
+
+        return new PolicyInfoResult(
+            IsDeployed:    "True",
+            IsBasePolicy:  isBasePolicy,
+            BasePolicyId:  basePolicyId,
+            Version:       version,
+            IsSignedPolicy: isSignedPolicy,
+            PolicyOptions: policyOptions);
+    }
+
+    // Option rule names indexed by bit position (WDAC policy rule option numbers).
+    // Source: Microsoft WDAC documentation + BinaryOpsForward.cs (HotCakeX/Harden-Windows-Security)
+    private static readonly string?[] s_optionNames =
+    [
+        "Enabled:UMCI",                                    // bit  0
+        "Enabled:Boot Menu Protection",                    // bit  1
+        "Required:WHQL",                                   // bit  2
+        "Enabled:Audit Mode",                              // bit  3
+        "Disabled:Flight Signing",                         // bit  4
+        "Enabled:Inherit Default Policy",                  // bit  5
+        "Enabled:Unsigned System Integrity Policy",        // bit  6
+        "Allowed:Debug Policy Augmented",                  // bit  7
+        "Required:EV Signers",                             // bit  8
+        "Enabled:Advanced Boot Options Menu",              // bit  9
+        "Enabled:Boot Audit on Failure",                   // bit 10
+        "Disabled:Script Enforcement",                     // bit 11
+        "Required:Enforce Store Applications",             // bit 12
+        "Enabled:Managed Installer",                       // bit 13
+        "Enabled:Intelligent Security Graph Authorization",// bit 14
+        "Enabled:Invalidate EAs on Reboot",               // bit 15
+        "Enabled:Update Policy No Reboot",                 // bit 16
+        "Enabled:Allow Supplemental Policies",             // bit 17
+        "Disabled:Runtime FilePath Rule Protection",       // bit 18
+        "Enabled:Dynamic Code Security",                   // bit 19
+        "Enabled:Revoked Expired As Unsigned",             // bit 20
+    ];
+
+    private static string DecodeOptionFlags(uint flags)
+    {
+        var opts = new List<string>();
+        for (int i = 0; i < s_optionNames.Length; i++)
+        {
+            if ((flags & (1u << i)) != 0 && s_optionNames[i] is { } name)
+                opts.Add(name);
+        }
+        return opts.Count > 0 ? string.Join(", ", opts) : "-";
     }
 
     private static CimInstance? FindInstance(CimSession session, string className, string policyGuid)

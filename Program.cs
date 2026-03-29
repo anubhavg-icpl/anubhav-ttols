@@ -115,17 +115,62 @@ static int RunList(PolicyManager manager)
         var (exitCode, results) = manager.List();
         if (results.Count == 0)
         {
-            Console.WriteLine("No policies deployed via ApplicationControl CSP.");
+            Console.WriteLine("No policies deployed.");
             return 0;
         }
 
-        Console.WriteLine($"{"GUID",-40} {"Authorized",-12} {"Deployed",-10} {"Effective",-10} {"Status",-8} {"Version"}");
-        Console.WriteLine(new string('-', 100));
+        // ── column widths ────────────────────────────────────────────────────
+        int wNum    = results.Count.ToString().Length + 1; // e.g. 2 for ≤99 policies
+        const int wId     = 36;   // GUID is always 36 chars
+        const int wSigned =  7;   // True / False
+        const int wBase   =  7;   // True / False
+        const int wDep    =  9;   // True
+        const int wVer    = 14;   // e.g. 10.29480.0.0
+        // total visible width
+        int totalW = wNum + wId + wSigned + wBase + wDep + wVer + 15;
 
-        foreach (var (policy, info) in results)
+        string Bar() => new string('─', totalW);
+
+        // ── header ──────────────────────────────────────────────────────────
+        Console.WriteLine(Bar());
+        Console.WriteLine(
+            " " + "#".PadRight(wNum)            + " │ " +
+            "POLICY ID".PadRight(wId)           + " │ " +
+            "SIGNED".PadRight(wSigned)          + " │ " +
+            "BASE".PadRight(wBase)              + " │ " +
+            "DEPLOYED".PadRight(wDep)           + " │ " +
+            "VERSION");
+        Console.WriteLine(Bar());
+
+        // ── rows ─────────────────────────────────────────────────────────────
+        for (int i = 0; i < results.Count; i++)
         {
-            Console.WriteLine($"{policy.InstanceId,-40} {info.IsAuthorized,-12} {info.IsDeployed,-10} {info.IsEffective,-10} {info.Status,-8} {info.Version}");
+            var (policy, info) = results[i];
+
+            Console.WriteLine(
+                " " + (i + 1).ToString().PadRight(wNum) + " │ " +
+                policy.InstanceId.PadRight(wId)         + " │ " +
+                info.IsSignedPolicy.PadRight(wSigned)   + " │ " +
+                info.IsBasePolicy.PadRight(wBase)       + " │ " +
+                info.IsDeployed.PadRight(wDep)          + " │ " +
+                info.Version);
+
+            if (info.PolicyOptions != "-")
+            {
+                string prefix = "   " + new string(' ', wNum) + "   Options : ";
+                string indent = new string(' ', prefix.Length);
+                PrintWrapped(prefix, indent, info.PolicyOptions, totalW);
+            }
+
+            // blank line between entries (but not after the last one)
+            if (i < results.Count - 1)
+                Console.WriteLine();
         }
+
+        // ── footer ──────────────────────────────────────────────────────────
+        Console.WriteLine(Bar());
+        Console.WriteLine($"  {results.Count} polic{(results.Count == 1 ? "y" : "ies")}");
+
         return exitCode;
     }
     catch (Exception ex)
@@ -133,6 +178,38 @@ static int RunList(PolicyManager manager)
         WriteError($"Error listing policies: {ex.Message}");
         return 1;
     }
+}
+
+/// <summary>
+/// Prints comma-separated <paramref name="text"/> with word-wrapping at
+/// <paramref name="maxWidth"/> columns.  The first line starts with
+/// <paramref name="prefix"/>; subsequent continuation lines start with
+/// <paramref name="indent"/> (same visual length as prefix).
+/// </summary>
+static void PrintWrapped(string prefix, string indent, string text, int maxWidth)
+{
+    string[] tokens = text.Split(", ", StringSplitOptions.RemoveEmptyEntries);
+    string current  = prefix;
+
+    foreach (string token in tokens)
+    {
+        // first token on a new line — no leading separator
+        bool isFirst = current == prefix || current == indent;
+        string candidate = isFirst ? current + token : current + ", " + token;
+
+        if (candidate.Length > maxWidth && !isFirst)
+        {
+            Console.WriteLine(current + ",");
+            current = indent + token;
+        }
+        else
+        {
+            current = candidate;
+        }
+    }
+
+    if (current.Length > 0)
+        Console.WriteLine(current);
 }
 
 static int PrintUsage()
